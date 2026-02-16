@@ -46,12 +46,8 @@ RUN bundle exec jekyll build --destination /out/_site
 FROM node:16-buster AS portal
 WORKDIR /portal
 
-# Copy the Angular app code into the image
-COPY _data-portal/ /portal/
-# Copy helper scripts used during the build
-COPY docker/scripts/ /portal/docker/scripts/
-
 # Install npm dependencies, allowing the older peer dependency rules this app needs
+COPY _data-portal/package.json _data-portal/package-lock.json /portal/
 RUN npm install --unsafe-perm --legacy-peer-deps
 
 # Install the build tools and runtime libraries at the older versions this app expects
@@ -65,6 +61,11 @@ RUN npm i --no-save \
   zone.js@0.8.29 \
   reflect-metadata@0.1.10 \
   core-js@2.4.1
+
+# Copy the Angular app code into the image
+COPY _data-portal/ /portal/
+# Copy helper scripts used during the build
+COPY docker/scripts/ /portal/docker/scripts/
 
 # Ensure production mode is enabled and use the runtime bootstrap
 RUN bash docker/scripts/fix-main-ts.sh
