@@ -10,6 +10,7 @@ set -euo pipefail
 # - macOS with colima installed
 # - docker CLI installed (with buildx support)
 # - python3 available (for local indexing)
+# - node available when using --fe-dev
 # - network access to the MySQL host in config.ini (e.g., mysql-igsr-web)
 # - local clones of gca_1000genomes_website, igsr-be, and es/es-py
 # - open ports: 9200 (ES), 8000 (API), 8080 (FE)
@@ -43,7 +44,7 @@ set -euo pipefail
 # - --fe-port PORT       FE host port (default: 8080)
 # - --no-cache         Disable Docker build cache (default: on)
 # - --use-cache        Enable Docker build cache (default: off)
-# - --skip-index       Skip ES indexing (default: off)
+# - --skip-index       Skip ES indexing only when ES indices already exist (default: off)
 # - --fe-dev           Start portal watch/sync mode after FE container starts (default: off)
 # - --reset-colima     Delete/recreate Colima profiles (default: off)
 # - --dry-run          Print what would happen without running commands (default: off)
@@ -87,7 +88,7 @@ ENV_FILE=""
 CONFIG_FILE=""
 
 NO_CACHE=1                            # 1 = rebuild images without cache
-SKIP_INDEX=0                          # 1 = skip ES indexing
+SKIP_INDEX=0                          # 1 = skip ES indexing only if indices exist
 FE_DEV=0                              # 1 = start portal watch/sync mode after stack startup
 RESET_COLIMA=0                        # 1 = delete/recreate colima profiles
 DRY_RUN=0                             # 1 = print actions only
@@ -103,6 +104,8 @@ ES_PY_REPO_SET=0
 ENV_FILE_SET=0
 CONFIG_FILE_SET=0
 ESPY_VENV_DIR_SET=0
+
+PORTAL_WEBPACK_PID=""
 
 log() { printf "\n==> %s\n" "$*"; }
 warn() { printf "\nWARN: %s\n" "$*" >&2; }
@@ -153,7 +156,7 @@ Options:
   --fe-port PORT       FE host port (default: 8080)
   --no-cache           Disable Docker build cache (default)
   --use-cache          Enable Docker build cache
-  --skip-index         Skip ES indexing
+  --skip-index         Skip ES indexing only if ES indices already exist
   --fe-dev             Start portal watch/sync mode after FE starts
   --reset-colima       Delete/recreate Colima profiles
   --dry-run            Print actions only (no changes)
@@ -262,12 +265,32 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
 }
 
+portal_dev_get_mtime() {
+  local f="$1"
+  if stat -f %m "$f" >/dev/null 2>&1; then
+    stat -f %m "$f"
+  else
+    stat -c %Y "$f"
+  fi
+}
+
+portal_dev_cleanup() {
+  if [ -n "$PORTAL_WEBPACK_PID" ] && kill -0 "$PORTAL_WEBPACK_PID" >/dev/null 2>&1; then
+    log "Stopping webpack watcher (pid=$PORTAL_WEBPACK_PID)"
+    kill "$PORTAL_WEBPACK_PID" >/dev/null 2>&1 || true
+    wait "$PORTAL_WEBPACK_PID" >/dev/null 2>&1 || true
+  fi
+}
+
 check_prereqs() {
   log "Checking prerequisites"
   need_cmd colima
   need_cmd docker
   if [ "$SKIP_INDEX" != "1" ]; then
     need_cmd python3
+  fi
+  if [ "$FE_DEV" = "1" ]; then
+    need_cmd node
   fi
 
   if ! docker buildx version >/dev/null 2>&1; then
@@ -623,15 +646,45 @@ start_es() {
 }
 
 index_es() {
-  if [ "$SKIP_INDEX" = "1" ]; then
-    log "Skipping ES indexing (SKIP_INDEX=1)"
-    return 0
-  fi
   if [ "$DRY_RUN" = "1" ]; then
-    log "DRY RUN: would run es-py indexing locally"
+    if [ "$SKIP_INDEX" = "1" ]; then
+      log "DRY RUN: would check ES indices and skip indexing only if indices already exist"
+    else
+      log "DRY RUN: would run es-py indexing locally"
+    fi
     return 0
   fi
+
+  if [ "$SKIP_INDEX" = "1" ]; then
+    if es_indices_exist; then
+      log "Skipping ES indexing (SKIP_INDEX=1 and existing indices detected)"
+      return 0
+    fi
+    warn "SKIP_INDEX=1 but no non-system ES indices were found; running indexing to create required indices."
+  fi
+
   index_es_local
+}
+
+es_indices_exist() {
+  local indices_url="http://localhost:${ES_PORT}/_cat/indices?format=txt&h=index"
+  local index_lines
+
+  if ! command -v curl >/dev/null 2>&1; then
+    warn "curl not found; cannot check if ES indices exist."
+    return 1
+  fi
+
+  if ! index_lines="$(curl -fsS "$indices_url" 2>/dev/null)"; then
+    warn "Unable to check ES indices at ${indices_url}."
+    return 1
+  fi
+
+  if printf '%s\n' "$index_lines" | awk 'NF && $1 !~ /^\./ {found=1} END {exit found ? 0 : 1}'; then
+    return 0
+  fi
+
+  return 1
 }
 
 index_es_local() {
@@ -744,28 +797,61 @@ run_portal_dev_mode() {
     return 0
   fi
 
-  local portal_dev_script="$SCRIPT_DIR/portal-dev"
-  if [ ! -x "$portal_dev_script" ]; then
-    die "FE_DEV=1 requires executable script: $portal_dev_script"
-  fi
+  local portal_dir="$FE_REPO/_data-portal"
+  local build_js_rel="static/build.js"
+  local build_js="${portal_dir}/${build_js_rel}"
+  local container_path="/usr/share/nginx/html/data-portal/static/build.js"
+  local poll_seconds="1"
 
   if [ "$DRY_RUN" = "1" ]; then
-    log "DRY RUN: $portal_dev_script --context $FE_CONTEXT --container $FE_CONTAINER --portal-dir $FE_REPO/_data-portal"
+    log "DRY RUN: would start webpack watch in $portal_dir and sync ${build_js_rel} into ${FE_CONTAINER}"
     return 0
   fi
 
+  [ -d "$portal_dir" ] || die "Portal directory not found: $portal_dir"
+  [ -f "$portal_dir/webpack.config.js" ] || die "Missing webpack config: $portal_dir/webpack.config.js"
+  [ -x "$portal_dir/node_modules/webpack/bin/webpack.js" ] || die "Missing webpack binary. Run: (cd $portal_dir && npm install --unsafe-perm --legacy-peer-deps)"
+
+  if ! docker --context "$FE_CONTEXT" ps --format '{{.Names}}' | grep -qx "$FE_CONTAINER"; then
+    die "Container '$FE_CONTAINER' not running in context '$FE_CONTEXT'"
+  fi
+
   log "FE_DEV=1: starting portal watch/sync (Ctrl-C to stop watcher; containers stay running)"
+  trap portal_dev_cleanup EXIT INT TERM
+  (
+    cd "$portal_dir"
+    exec node node_modules/webpack/bin/webpack.js --watch --config webpack.config.js
+  ) &
+  PORTAL_WEBPACK_PID="$!"
+
+  local last_mtime=""
+  local rc=0
   set +e
-  "$portal_dev_script" --context "$FE_CONTEXT" --container "$FE_CONTAINER" --portal-dir "$FE_REPO/_data-portal"
-  local rc=$?
+  while kill -0 "$PORTAL_WEBPACK_PID" >/dev/null 2>&1; do
+    if [ -f "$build_js" ]; then
+      local current_mtime
+      current_mtime="$(portal_dev_get_mtime "$build_js")"
+      if [ "$current_mtime" != "$last_mtime" ]; then
+        docker --context "$FE_CONTEXT" cp "$build_js" "${FE_CONTAINER}:${container_path}"
+        log "Synced ${build_js_rel} to ${FE_CONTAINER}"
+        last_mtime="$current_mtime"
+      fi
+    fi
+    sleep "$poll_seconds"
+  done
+  wait "$PORTAL_WEBPACK_PID"
+  rc=$?
   set -e
+
+  trap - EXIT INT TERM
+  PORTAL_WEBPACK_PID=""
 
   if [ "$rc" -eq 130 ] || [ "$rc" -eq 143 ]; then
     log "Portal watch stopped by signal; containers are still running"
     return 0
   fi
   if [ "$rc" -ne 0 ]; then
-    die "portal-dev exited with status $rc"
+    die "Portal watch/sync exited with status $rc"
   fi
 }
 
