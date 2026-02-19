@@ -44,6 +44,7 @@ set -euo pipefail
 # - --no-cache         Disable Docker build cache (default: on)
 # - --use-cache        Enable Docker build cache (default: off)
 # - --skip-index       Skip ES indexing (default: off)
+# - --fe-dev           Start portal watch/sync mode after FE container starts (default: off)
 # - --reset-colima     Delete/recreate Colima profiles (default: off)
 # - --dry-run          Print what would happen without running commands (default: off)
 # - --colima-dns LIST  Comma-separated DNS servers for Colima (e.g. 8.8.8.8,1.1.1.1)
@@ -87,6 +88,7 @@ CONFIG_FILE=""
 
 NO_CACHE=1                            # 1 = rebuild images without cache
 SKIP_INDEX=0                          # 1 = skip ES indexing
+FE_DEV=0                              # 1 = start portal watch/sync mode after stack startup
 RESET_COLIMA=0                        # 1 = delete/recreate colima profiles
 DRY_RUN=0                             # 1 = print actions only
 ESPY_VENV_DIR=""
@@ -152,6 +154,7 @@ Options:
   --no-cache           Disable Docker build cache (default)
   --use-cache          Enable Docker build cache
   --skip-index         Skip ES indexing
+  --fe-dev             Start portal watch/sync mode after FE starts
   --reset-colima       Delete/recreate Colima profiles
   --dry-run            Print actions only (no changes)
   --colima-dns LIST    Comma-separated DNS servers for Colima
@@ -210,6 +213,8 @@ parse_args() {
         NO_CACHE=0; shift 1 ;;
       --skip-index)
         SKIP_INDEX=1; shift 1 ;;
+      --fe-dev)
+        FE_DEV=1; shift 1 ;;
       --reset-colima)
         RESET_COLIMA=1; shift 1 ;;
       --dry-run)
@@ -341,6 +346,7 @@ Ports:
 Flags:
   NO_CACHE    = $NO_CACHE
   SKIP_INDEX  = $SKIP_INDEX
+  FE_DEV      = $FE_DEV
   RESET_COLIMA= $RESET_COLIMA
   DRY_RUN     = $DRY_RUN
 EOF
@@ -706,17 +712,61 @@ build_and_start_be() {
 build_and_start_fe() {
   log "Building igsr-fe (amd64)"
   if [ "$DRY_RUN" = "1" ]; then
-    log "DRY RUN: docker --context $FE_CONTEXT build $(cache_arg) --platform $FE_PLATFORM -t $FE_IMAGE $FE_REPO"
+    if [ "$FE_DEV" = "1" ]; then
+      log "DRY RUN: if image missing: docker --context $FE_CONTEXT build $(cache_arg) --platform $FE_PLATFORM -t $FE_IMAGE $FE_REPO"
+    else
+      log "DRY RUN: docker --context $FE_CONTEXT build $(cache_arg) --platform $FE_PLATFORM -t $FE_IMAGE $FE_REPO"
+    fi
     log "DRY RUN: docker --context $FE_CONTEXT run -d --name $FE_CONTAINER ..."
     return 0
   fi
-  docker --context "$FE_CONTEXT" build $(cache_arg) --platform "$FE_PLATFORM" -t "$FE_IMAGE" "$FE_REPO"
+
+  if [ "$FE_DEV" = "1" ]; then
+    if docker --context "$FE_CONTEXT" image inspect "$FE_IMAGE" >/dev/null 2>&1; then
+      log "FE_DEV=1: reusing existing FE image ($FE_IMAGE), skipping FE rebuild"
+    else
+      log "FE_DEV=1: FE image not found, building once"
+      docker --context "$FE_CONTEXT" build $(cache_arg) --platform "$FE_PLATFORM" -t "$FE_IMAGE" "$FE_REPO"
+    fi
+  else
+    docker --context "$FE_CONTEXT" build $(cache_arg) --platform "$FE_PLATFORM" -t "$FE_IMAGE" "$FE_REPO"
+  fi
 
   log "Starting igsr-fe"
   docker --context "$FE_CONTEXT" run -d --name "$FE_CONTAINER" \
     -p "${FE_PORT}:80" \
     -e API_BASE="$FE_API_BASE" \
     "$FE_IMAGE" >/dev/null
+}
+
+run_portal_dev_mode() {
+  if [ "$FE_DEV" != "1" ]; then
+    return 0
+  fi
+
+  local portal_dev_script="$SCRIPT_DIR/portal-dev"
+  if [ ! -x "$portal_dev_script" ]; then
+    die "FE_DEV=1 requires executable script: $portal_dev_script"
+  fi
+
+  if [ "$DRY_RUN" = "1" ]; then
+    log "DRY RUN: $portal_dev_script --context $FE_CONTEXT --container $FE_CONTAINER --portal-dir $FE_REPO/_data-portal"
+    return 0
+  fi
+
+  log "FE_DEV=1: starting portal watch/sync (Ctrl-C to stop watcher; containers stay running)"
+  set +e
+  "$portal_dev_script" --context "$FE_CONTEXT" --container "$FE_CONTAINER" --portal-dir "$FE_REPO/_data-portal"
+  local rc=$?
+  set -e
+
+  if [ "$rc" -eq 130 ] || [ "$rc" -eq 143 ]; then
+    log "Portal watch stopped by signal; containers are still running"
+    return 0
+  fi
+  if [ "$rc" -ne 0 ]; then
+    die "portal-dev exited with status $rc"
+  fi
 }
 
 main() {
@@ -770,6 +820,7 @@ main() {
   echo "FE: http://localhost:${FE_PORT}/"
   echo "BE: http://localhost:${BE_PORT}/beta/health"
   echo "ES: http://localhost:${ES_PORT}/"
+  run_portal_dev_mode
 }
 
 main "$@"
