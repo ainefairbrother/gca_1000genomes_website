@@ -8,12 +8,10 @@ import 'rxjs/add/operator/switchMap';
 import { ApiPopulationService } from '../core/services/api-population.service';
 import { ApiAnalysisGroupService } from '../core/services/api-analysis-group.service';
 import { ApiDataCollectionService } from '../core/services/api-data-collection.service';
-import { ApiSuperPopulationService } from '../core/services/api-superpopulation.service';
 import { AnalysisGroup } from '../shared/api-types/analysis-group';
 import { DataCollection } from '../shared/api-types/data-collection';
 import { SearchHit, SearchHits } from '../shared/api-types/search-hits';
 import { Population } from '../shared/api-types/population';
-import { SuperPopulation } from '../shared/api-types/superpopulation';
 import { buildReadableFilterSummary as buildReadableFilterSummaryFromRpn } from '../shared/filter-builder-summary';
 import { FilterBuilderBase, FilterSelectionChange, FilterTokenBase } from '../shared/filter-builder-base';
 import { filterBuilderStyles } from '../shared/filter-builder.styles';
@@ -157,17 +155,15 @@ export class PopulationHomeComponent extends FilterBuilderBase<'dc' | 'ag', Filt
     private apiPopulationService: ApiPopulationService,
     private apiAnalysisGroupService: ApiAnalysisGroupService,
     private apiDataCollectionService: ApiDataCollectionService,
-    private apiSuperPopulationService: ApiSuperPopulationService,
   ) {
     super();
     this.agTitleMap = this.apiAnalysisGroupService.titleMap;
     this.dcTitleMap = this.apiDataCollectionService.titleMap;
   }
 
-  public populationHits: SearchHits<Population>;
-  public superpopHits: SearchHits<SuperPopulation>;
-  public dataCollectionList: SearchHits<DataCollection>;
-  public analysisGroupList: SearchHits<AnalysisGroup>;
+  public populationHits: SearchHits<Population> | null = null;
+  public dataCollectionList: SearchHits<DataCollection> | null = null;
+  public analysisGroupList: SearchHits<AnalysisGroup> | null = null;
   public viewOption: number = 0;
   public filterBuilderCollapsed: boolean = true;
 
@@ -184,36 +180,15 @@ export class PopulationHomeComponent extends FilterBuilderBase<'dc' | 'ag', Filt
   public readableFilterSummary: string = '';
   public mapKeyVisible: boolean = false;
 
-  private populationHitsSource: Subject<Observable<SearchHits<Population>>>;
-  private populationHitsSubscription: Subscription = null;
-  private superpopulationSubscription: Subscription = null;
-  private dataCollectionSubscription: Subscription = null;
-  private analysisGroupSubscription: Subscription = null;
+  private populationHitsSource: Subject<Observable<SearchHits<Population>>> = new Subject<Observable<SearchHits<Population>>>();
+  private populationHitsSubscription: Subscription | null = null;
+  private dataCollectionSubscription: Subscription | null = null;
+  private analysisGroupSubscription: Subscription | null = null;
   private map: any;
   private mapLayer: any;
   private markers: any;
   private markerRadius: number = 20;
-  private readonly continentMap: Record<string, string> = {
-    'East Asian Ancestry': 'Asia',
-    'European Ancestry': 'Europe',
-    'African Ancestry': 'Africa',
-    'American Ancestry': 'America',
-    'South Asian Ancestry': 'Asia',
-    'America (HGDP)': 'America',
-    'Central South Asia (HGDP)': 'Asia',
-    'Europe (HGDP)': 'Europe',
-    'Middle East (HGDP)': 'Middle East',
-    'East Asia (HGDP)': 'Asia',
-    'Oceania (HGDP)': 'Oceania',
-    'Africa (HGDP)': 'Africa',
-    'Africa (SGDP)': 'Africa',
-    'America (SGDP)': 'America',
-    'Central Asia and Siberia (SGDP)': 'Asia',
-    'East Asia (SGDP)': 'Asia',
-    'Oceania (SGDP)': 'Oceania',
-    'South Asia (SGDP)': 'Asia',
-    'West Eurasia (SGDP)': 'Europe',
-  };
+  
 
   ngOnInit() {
     this.titleService.setTitle('IGSR | populations');
@@ -228,8 +203,6 @@ export class PopulationHomeComponent extends FilterBuilderBase<'dc' | 'ag', Filt
       .subscribe((l: SearchHits<DataCollection>) => this.dataCollectionList = l);
     this.analysisGroupSubscription = this.apiAnalysisGroupService.getAll()
       .subscribe((l: SearchHits<AnalysisGroup>) => this.analysisGroupList = l);
-    this.superpopulationSubscription = this.apiSuperPopulationService.getAll()
-      .subscribe((h: SearchHits<SuperPopulation>) => this.superpopHits = this.sortSuperpopulations(h));
     this.search();
   }
 
@@ -247,9 +220,6 @@ export class PopulationHomeComponent extends FilterBuilderBase<'dc' | 'ag', Filt
     if (this.analysisGroupSubscription) {
       this.analysisGroupSubscription.unsubscribe();
     }
-    if (this.superpopulationSubscription) {
-      this.superpopulationSubscription.unsubscribe();
-    }
     if (this.map) {
       this.map.remove();
       this.map = null;
@@ -263,10 +233,12 @@ export class PopulationHomeComponent extends FilterBuilderBase<'dc' | 'ag', Filt
 
   dataCollectionView() {
     this.viewOption = 1;
+    this.destroyMap();
   }
 
   technologyView() {
     this.viewOption = 2;
+    this.destroyMap();
   }
 
   onAgFiltersChange(change: FilterSelectionChange) {
@@ -324,27 +296,6 @@ export class PopulationHomeComponent extends FilterBuilderBase<'dc' | 'ag', Filt
   toggleAgFilter(code: string) {
     this.agFilters[code] = !this.agFilters[code];
     this.onAgFiltersChange({ filters: this.agFilters, code, isFiltered: this.agFilters[code] });
-  }
-
-  get populationsByContinent(): { continent: string; superPopulations: SearchHit<SuperPopulation>[] }[] {
-    if (!this.superpopHits || !this.superpopHits.hits) {
-      return [];
-    }
-    let grouped: {[continent: string]: SearchHit<SuperPopulation>[]} = {};
-    for (let pop of this.superpopHits.hits) {
-      let popName = pop && pop._source ? pop._source.name : '';
-      let continent = this.continentMap[popName] || 'Other';
-      if (!grouped[continent]) {
-        grouped[continent] = [];
-      }
-      grouped[continent].push(pop);
-    }
-    return Object.keys(grouped)
-      .sort((a: string, b: string) => a.localeCompare(b))
-      .map((continent: string) => ({
-        continent,
-        superPopulations: grouped[continent],
-      }));
   }
 
   public hasDataCollection(population: Population, dc: DataCollection): boolean {
@@ -443,24 +394,41 @@ export class PopulationHomeComponent extends FilterBuilderBase<'dc' | 'ag', Filt
       if (!mapElement) {
         return;
       }
-      if (!this.map) {
-        this.map = new L.map('population-map').setView([0, 0], 2);
-        this.map.options.minZoom = 2;
-        this.map.options.maxZoom = 6;
-        this.mapLayer = L.tileLayer('https://tiles.stadiamaps.com/tiles/stamen_toner_lite/{z}/{x}/{y}{r}.png', {
-          attribution: '&copy; <a href="https://stadiamaps.com/" target="_blank">Stadia Maps</a>, &copy; <a href="https://stamen.com/" target="_blank">Stamen Design</a>, &copy; <a href="https://openmaptiles.org/" target="_blank">OpenMapTiles</a>, &copy; <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap</a>',
-          minZoom: 0,
-          maxZoom: 20,
-          ext: 'png'
-        }).addTo(this.map);
-        let corner1 = new L.latLng(-90, -180);
-        let corner2 = new L.latLng(90, 180);
-        this.map.options.maxBounds = new L.latLngBounds(corner1, corner2);
-        this.map.options.maxBoundsViscosity = 1.0;
+      if (!this.map || this.map.getContainer() !== mapElement) {
+        this.initializeMap(mapElement);
       }
       this.plotPopulationHits();
-      this.map.invalidateSize();
+      if (this.map) {
+        this.map.invalidateSize();
+        setTimeout(() => this.map.invalidateSize(), 0);
+      }
     }, 0);
+  }
+
+  private initializeMap(mapElement: HTMLElement) {
+    this.destroyMap();
+    this.map = new L.map(mapElement).setView([0, 0], 2);
+    this.map.options.minZoom = 2;
+    this.map.options.maxZoom = 6;
+    this.mapLayer = L.tileLayer('https://tiles.stadiamaps.com/tiles/stamen_toner_lite/{z}/{x}/{y}{r}.png', {
+      attribution: '&copy; <a href="https://stadiamaps.com/" target="_blank">Stadia Maps</a>, &copy; <a href="https://stamen.com/" target="_blank">Stamen Design</a>, &copy; <a href="https://openmaptiles.org/" target="_blank">OpenMapTiles</a>, &copy; <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap</a>',
+      minZoom: 0,
+      maxZoom: 20,
+      ext: 'png'
+    }).addTo(this.map);
+    let corner1 = new L.latLng(-90, -180);
+    let corner2 = new L.latLng(90, 180);
+    this.map.options.maxBounds = new L.latLngBounds(corner1, corner2);
+    this.map.options.maxBoundsViscosity = 1.0;
+  }
+
+  private destroyMap() {
+    if (this.map) {
+      this.map.remove();
+      this.map = null;
+    }
+    this.mapLayer = null;
+    this.markers = null;
   }
 
   private plotPopulationHits() {
@@ -473,15 +441,15 @@ export class PopulationHomeComponent extends FilterBuilderBase<'dc' | 'ag', Filt
     this.markers = new L.markerClusterGroup({ maxClusterRadius: this.markerRadius });
     for (let hit of this.populationHits.hits) {
       let population = hit._source;
-      let displayColour = population.superpopulation && population.superpopulation.display_colour ? population.superpopulation.display_colour : '#018ead';
+      let displayColour ='#018ead';
       let icon = this.createPopulationMarkerIcon(displayColour);
       let lat = Number(population.latitude);
       let lon = Number(population.longitude);
       if (isNaN(lat) || isNaN(lon)) {
         continue;
       }
-      let superpopulationName = population.superpopulation ? population.superpopulation.name : '';
-      this.markers.addLayer(new L.marker([lat, lon], { icon }).bindPopup(`<a href="/data-portal/population/${population.elasticId}">${population.description}</a><br>${superpopulationName}`));
+      
+      this.markers.addLayer(new L.marker([lat, lon], { icon }).bindPopup(`<a href="/data-portal/population/${population.elasticId}">${population.description}</a>`));
     }
     this.map.addLayer(this.markers);
   }
@@ -490,7 +458,7 @@ export class PopulationHomeComponent extends FilterBuilderBase<'dc' | 'ag', Filt
     if (L.MakiMarkers && L.MakiMarkers.accessToken) {
       return L.MakiMarkers.icon({ icon: 'circle-stroked', color, size: 's' });
     }
-    let displayColor = /^#[0-9a-fA-F]{3}([0-9a-fA-F]{3})?$/.test(color || '') ? color : '#018ead';
+    let displayColor ='#018ead';
     return L.divIcon({
       className: 'population-marker',
       html: `<span style="box-sizing:border-box;display:block;position:relative;width:22px;height:22px;background:${displayColor};border:2px solid rgba(0,0,0,.25);border-radius:50% 50% 50% 0;box-shadow:4px 4px 8px rgba(0,0,0,.35);transform:rotate(-45deg);"><span style="box-sizing:border-box;display:block;position:absolute;left:50%;top:50%;width:9px;height:9px;margin-left:-4.5px;margin-top:-4.5px;background:rgba(255,255,255,.18);border:2px solid #fff;border-radius:50%;transform:rotate(45deg);"></span></span>`,
@@ -500,15 +468,5 @@ export class PopulationHomeComponent extends FilterBuilderBase<'dc' | 'ag', Filt
     });
   }
 
-  private sortSuperpopulations(h: SearchHits<SuperPopulation>): SearchHits<SuperPopulation> {
-    if (!h || !h.hits) {
-      return h;
-    }
-    let sortedHits = ([] as SearchHit<SuperPopulation>[]).concat(h.hits).sort((a, b) => {
-      let aName = a && a._source && a._source.name ? a._source.name : '';
-      let bName = b && b._source && b._source.name ? b._source.name : '';
-      return aName.localeCompare(bName, undefined, { sensitivity: 'base' });
-    });
-    return Object.assign({}, h, { hits: sortedHits });
-  }
+  
 }
